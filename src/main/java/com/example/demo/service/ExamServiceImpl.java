@@ -20,6 +20,10 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.stream.Collectors;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Service
 public class ExamServiceImpl implements ExamService {
@@ -29,7 +33,6 @@ public class ExamServiceImpl implements ExamService {
     private final QuestionFormatTemplateRepository templateRepository;
     private final GeminiService geminiService;
 
-    // ID와 이름을 함께 관리하기 위한 내부 레코드
     private record DomainData(String id, String name) {}
 
     public ExamServiceImpl(ProblemRepository problemRepository,
@@ -49,10 +52,9 @@ public class ExamServiceImpl implements ExamService {
         List<DomainData> targetDomains = new ArrayList<>();
 
         if ("CHAPTER".equalsIgnoreCase(request.getGenerationType())) {
-            examTitle = request.getDomainName() + " 단원별 평가"; // 프론트가 준 한글 이름 적용
+            examTitle = request.getDomainName() + " 단원별 평가";
 
             for (int i = 0; i < request.getProblemCount(); i++) {
-                // 프론트가 보낸 ID와 Name을 매핑
                 targetDomains.add(new DomainData(request.getDomainId(), request.getDomainName()));
             }
         } else {
@@ -60,14 +62,15 @@ public class ExamServiceImpl implements ExamService {
             Random random = new Random();
             int targetCount = random.nextBoolean() ? 11 : 12;
 
-            // 모의고사는 임의의 가짜 ID와 이름을 세팅 (실제 운영시에는 DB 연동 필요)
-            targetDomains.add(new DomainData("mock_id_1", "1. 세포의 구성 물질"));
-            targetDomains.add(new DomainData("mock_id_2", "유전학"));
+            String[] mockDomainNames = {
+                    "분자생물학", "세포학", "유전학", "동물생리학",
+                    "식물생리학", "생태학", "진화생물학", "미생물학", "면역학", "발생학"
+            };
 
-            String[] mockDomainNames = {"동물생리학", "식물생리학", "생태학", "진화생물학", "미생물학"};
-            for (int i = 2; i < targetCount; i++) {
+            for (int i = 0; i < targetCount; i++) {
                 String randomName = mockDomainNames[random.nextInt(mockDomainNames.length)];
-                targetDomains.add(new DomainData("mock_id_" + randomName, randomName));
+                String fakeId = UUID.randomUUID().toString();
+                targetDomains.add(new DomainData(fakeId, randomName));
             }
             Collections.shuffle(targetDomains);
         }
@@ -89,77 +92,107 @@ public class ExamServiceImpl implements ExamService {
             Collections.shuffle(formats);
         }
 
-        List<Problem> actualProblemsToSave = new ArrayList<>();
-        List<ExamGenerateResponse.ProblemDto> problemDtos = new ArrayList<>();
+        // 스레드 풀 10개 유지 (안정성 확보)
+        int threadCount = Math.min(targetDomains.size(), 10);
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+
+        List<CompletableFuture<Problem>> futures = new ArrayList<>();
         JsonParser springJsonParser = JsonParserFactory.getJsonParser();
 
         for (int i = 0; i < targetDomains.size(); i++) {
-            DomainData currentDomainData = targetDomains.get(i);
-            QuestionFormatTemplate assignedFormat = formats.get(i % formats.size());
+            final int index = i;
+            final DomainData currentDomainData = targetDomains.get(i);
+            final QuestionFormatTemplate assignedFormat = formats.get(i % formats.size());
+            final String examId = exam.getId();
 
-            // AI 프롬프트에는 currentDomainData.name() 삽입
-            String generatePrompt = String.format(
-                    "당신은 생명과학 전공 임용고시 출제 위원입니다. 다음 '출제 단원'과 '출제 양식'을 엄격히 반영하여 대학교 전공 수준의 새로운 문제를 1개 출제하세요.\n" +
-                            "반드시 아래의 JSON 포맷으로만 응답해야 하며, 마크다운이나 부가 설명은 절대 추가하지 마세요.\n\n" +
-                            "출력 포맷: {\"title\": \"문제 제목\", \"content\": \"문제 지문 내용\", \"referenceAnswer\": \"모범 답안\", \"rubric\": [\"채점 기준 1\", \"채점 기준 2\"]}\n\n" +
-                            "[출제 단원]: %s\n" +
-                            "[요구되는 출제 양식]: %s\n" +
-                            "[답안 작성 예시]: %s",
-                    currentDomainData.name(), assignedFormat.getQuestionExample(), assignedFormat.getAnswerExample()
-            );
+            CompletableFuture<Problem> future = CompletableFuture.supplyAsync(() -> {
+                Problem newProblem = new Problem();
+                newProblem.setExamId(examId);
+                newProblem.setDomainId(currentDomainData.id());
+                newProblem.setProblemNumber(index + 1);
+                newProblem.setQuestionType(assignedFormat.getTypeName());
+                newProblem.setOptions(new ArrayList<>());
 
-            String rawAiResponse = geminiService.generateContent(generatePrompt);
+                String generatePrompt = String.format(
+                        "당신은 생명과학 전공 임용고시 출제 위원입니다. 다음 '출제 단원'과 '출제 양식'을 엄격히 반영하여 실제 임용고시(필요시 인터넷을 참고하세요) 수준의 새로운 문제를 1개 출제하세요.\n" +
+                                "또한 출제 양식을 준수하고 답안이 너무 길어지는 것을 방지하세요.(한문제의 핵심키워드에 대한 설명 수준)\n" +
+                                "반드시 아래의 JSON 포맷으로만 응답해야 하며, 마크다운이나 부가 설명은 절대 추가하지 마세요.\n\n" +
+                                "출력 포맷: {\"title\": \"문제 제목\", \"content\": \"문제 지문 내용\", \"referenceAnswer\": \"모범 답안\", \"rubric\": [\"채점 기준 1\", \"채점 기준 2\"]}\n\n" +
+                                "[출제 단원]: %s\n" +
+                                "[요구되는 출제 양식]: %s\n" +
+                                "[답안 작성 예시]: %s",
+                        currentDomainData.name(), assignedFormat.getQuestionExample(), assignedFormat.getAnswerExample()
+                );
 
-            Problem newProblem = new Problem();
-            newProblem.setExamId(exam.getId());
-            // DB 엔티티에는 currentDomainData.id() 삽입
-            newProblem.setDomainId(currentDomainData.id());
-            newProblem.setProblemNumber(i + 1);
-            newProblem.setQuestionType(assignedFormat.getTypeName());
-            newProblem.setOptions(new ArrayList<>());
+                int maxRetries = 2; // 최대 2번 재시도
+                int attempt = 0;
+                boolean success = false;
 
-            try {
-                String cleanJson = rawAiResponse.replaceAll("```json", "").replaceAll("```", "").trim();
-                Map<String, Object> parsedMap = springJsonParser.parseMap(cleanJson);
+                while (attempt < maxRetries && !success) {
+                    try {
+                        String rawAiResponse = geminiService.generateContent(generatePrompt);
+                        String cleanJson = rawAiResponse.replaceAll("```json", "").replaceAll("```", "").trim();
+                        Map<String, Object> parsedMap = springJsonParser.parseMap(cleanJson);
 
-                newProblem.setTitle((String) parsedMap.getOrDefault("title", currentDomainData.name() + " 문제"));
-                newProblem.setContent((String) parsedMap.getOrDefault("content", "문제 지문 생성 실패"));
-                newProblem.setReferenceAnswer((String) parsedMap.getOrDefault("referenceAnswer", "모범 답안 생성 실패"));
+                        newProblem.setTitle((String) parsedMap.getOrDefault("title", currentDomainData.name() + " 문제"));
+                        newProblem.setContent((String) parsedMap.getOrDefault("content", "문제 지문 생성 실패"));
+                        newProblem.setReferenceAnswer((String) parsedMap.getOrDefault("referenceAnswer", "모범 답안 생성 실패"));
 
-                List<Map<String, Object>> rubricMapList = new ArrayList<>();
-                Object rubricObj = parsedMap.get("rubric");
+                        List<Map<String, Object>> rubricMapList = new ArrayList<>();
+                        Object rubricObj = parsedMap.get("rubric");
 
-                if (rubricObj instanceof List) {
-                    List<?> rawList = (List<?>) rubricObj;
-                    for (Object item : rawList) {
-                        Map<String, Object> mapItem = new HashMap<>();
-                        mapItem.put("criteria", String.valueOf(item));
-                        rubricMapList.add(mapItem);
+                        if (rubricObj instanceof List) {
+                            List<?> rawList = (List<?>) rubricObj;
+                            for (Object item : rawList) {
+                                Map<String, Object> mapItem = new HashMap<>();
+                                mapItem.put("criteria", String.valueOf(item));
+                                rubricMapList.add(mapItem);
+                            }
+                        } else {
+                            Map<String, Object> defaultMap = new HashMap<>();
+                            defaultMap.put("criteria", "채점 기준 없음");
+                            rubricMapList.add(defaultMap);
+                        }
+                        newProblem.setRubric(rubricMapList);
+                        success = true; // 파싱 성공 시 루프 탈출
+
+                    } catch (Exception e) {
+                        attempt++;
+                        if (attempt >= maxRetries) {
+                            // 재시도 초과 시 에러 메시지 맵핑
+                            System.err.println("문제 생성 최종 실패 (문제 번호: " + (index + 1) + ") - " + e.getMessage());
+                            newProblem.setTitle(currentDomainData.name() + " 문제 (생성 오류)");
+                            newProblem.setContent("AI 서버 응답 지연으로 인해 문제 지문을 생성하지 못했습니다.");
+                            newProblem.setReferenceAnswer("오류");
+
+                            List<Map<String, Object>> errorRubricList = new ArrayList<>();
+                            Map<String, Object> errorMap = new HashMap<>();
+                            errorMap.put("criteria", "오류");
+                            errorRubricList.add(errorMap);
+                            newProblem.setRubric(errorRubricList);
+                        } else {
+                            // 1초 대기 후 재시도
+                            try { Thread.sleep(1000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                        }
                     }
-                } else {
-                    Map<String, Object> defaultMap = new HashMap<>();
-                    defaultMap.put("criteria", "채점 기준 없음");
-                    rubricMapList.add(defaultMap);
                 }
-                newProblem.setRubric(rubricMapList);
+                return newProblem;
+            }, executor);
 
-            } catch (Exception e) {
-                newProblem.setTitle(currentDomainData.name() + " 문제 (생성 오류)");
-                newProblem.setContent("AI 응답 파싱 에러: " + rawAiResponse);
-                newProblem.setReferenceAnswer("오류");
-
-                List<Map<String, Object>> errorRubricList = new ArrayList<>();
-                Map<String, Object> errorMap = new HashMap<>();
-                errorMap.put("criteria", "오류");
-                errorRubricList.add(errorMap);
-                newProblem.setRubric(errorRubricList);
-            }
-
-            actualProblemsToSave.add(newProblem);
+            futures.add(future);
         }
 
-        List<Problem> savedProblems = problemRepository.saveAll(actualProblemsToSave);
+        // 전체 강제 타임아웃 제거: 모든 작업이 끝날 때까지 무한 대기
+        List<Problem> actualProblemsToSave = futures.stream()
+                .map(CompletableFuture::join)
+                .collect(Collectors.toList());
 
+        executor.shutdown(); // 스레드 풀 반환
+
+        List<Problem> savedProblems = problemRepository.saveAll(actualProblemsToSave);
+        savedProblems.sort(Comparator.comparingInt(Problem::getProblemNumber));
+
+        List<ExamGenerateResponse.ProblemDto> problemDtos = new ArrayList<>();
         for (Problem p : savedProblems) {
             problemDtos.add(new ExamGenerateResponse.ProblemDto(
                     p.getId(),

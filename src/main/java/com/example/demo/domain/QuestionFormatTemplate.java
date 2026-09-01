@@ -6,7 +6,7 @@ import org.springframework.data.mongodb.core.mapping.Field;
 
 import java.time.LocalDateTime;
 
-@Document(collection = "questionFormatTemplate")
+@Document(collection = "QuestionFormatTemplate")
 public class QuestionFormatTemplate {
 
     @Id
