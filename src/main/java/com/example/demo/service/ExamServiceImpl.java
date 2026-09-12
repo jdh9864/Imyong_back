@@ -20,10 +20,11 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.stream.Collectors;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 @Service
 public class ExamServiceImpl implements ExamService {
@@ -32,6 +33,10 @@ public class ExamServiceImpl implements ExamService {
     private final ExamRepository examRepository;
     private final QuestionFormatTemplateRepository templateRepository;
     private final GeminiService geminiService;
+
+    // 비동기 작업 상태 및 결과를 저장하는 Thread-Safe Map
+    private final Map<String, String> statusMap = new ConcurrentHashMap<>();
+    private final Map<String, ExamSubmitResponse> resultMap = new ConcurrentHashMap<>();
 
     private record DomainData(String id, String name) {}
 
@@ -92,7 +97,6 @@ public class ExamServiceImpl implements ExamService {
             Collections.shuffle(formats);
         }
 
-        // 스레드 풀 10개 유지 (안정성 확보)
         int threadCount = Math.min(targetDomains.size(), 10);
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
 
@@ -124,7 +128,7 @@ public class ExamServiceImpl implements ExamService {
                         currentDomainData.name(), assignedFormat.getQuestionExample(), assignedFormat.getAnswerExample()
                 );
 
-                int maxRetries = 2; // 최대 2번 재시도
+                int maxRetries = 2;
                 int attempt = 0;
                 boolean success = false;
 
@@ -154,12 +158,11 @@ public class ExamServiceImpl implements ExamService {
                             rubricMapList.add(defaultMap);
                         }
                         newProblem.setRubric(rubricMapList);
-                        success = true; // 파싱 성공 시 루프 탈출
+                        success = true;
 
                     } catch (Exception e) {
                         attempt++;
                         if (attempt >= maxRetries) {
-                            // 재시도 초과 시 에러 메시지 맵핑
                             System.err.println("문제 생성 최종 실패 (문제 번호: " + (index + 1) + ") - " + e.getMessage());
                             newProblem.setTitle(currentDomainData.name() + " 문제 (생성 오류)");
                             newProblem.setContent("AI 서버 응답 지연으로 인해 문제 지문을 생성하지 못했습니다.");
@@ -171,7 +174,6 @@ public class ExamServiceImpl implements ExamService {
                             errorRubricList.add(errorMap);
                             newProblem.setRubric(errorRubricList);
                         } else {
-                            // 1초 대기 후 재시도
                             try { Thread.sleep(1000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                         }
                     }
@@ -182,12 +184,11 @@ public class ExamServiceImpl implements ExamService {
             futures.add(future);
         }
 
-        // 전체 강제 타임아웃 제거: 모든 작업이 끝날 때까지 무한 대기
         List<Problem> actualProblemsToSave = futures.stream()
                 .map(CompletableFuture::join)
                 .collect(Collectors.toList());
 
-        executor.shutdown(); // 스레드 풀 반환
+        executor.shutdown();
 
         List<Problem> savedProblems = problemRepository.saveAll(actualProblemsToSave);
         savedProblems.sort(Comparator.comparingInt(Problem::getProblemNumber));
@@ -212,6 +213,40 @@ public class ExamServiceImpl implements ExamService {
         );
     }
 
+    // [추가] 비동기 채점 작업 할당 및 JobID 반환
+    @Override
+    public String submitExamAsync(ExamSubmitRequest request) {
+        String jobId = UUID.randomUUID().toString();
+        statusMap.put(jobId, "PROCESSING");
+
+        // CompletableFuture를 이용해 백그라운드 스레드에서 채점 진행
+        CompletableFuture.runAsync(() -> {
+            try {
+                ExamSubmitResponse response = submitAndGradeExam(request);
+                resultMap.put(jobId, response);
+                statusMap.put(jobId, "COMPLETED");
+            } catch (Exception e) {
+                System.err.println("비동기 채점 중 오류 발생: " + e.getMessage());
+                statusMap.put(jobId, "FAILED");
+            }
+        });
+
+        return jobId;
+    }
+
+    // [추가] 상태 조회
+    @Override
+    public String getSubmitStatus(String jobId) {
+        return statusMap.getOrDefault(jobId, "NOT_FOUND");
+    }
+
+    // [추가] 결과 조회
+    @Override
+    public ExamSubmitResponse getSubmitResult(String jobId) {
+        return resultMap.get(jobId);
+    }
+
+    // 기존의 채점 로직 (내부 스레드에서 호출됨)
     @Override
     @Transactional
     public ExamSubmitResponse submitAndGradeExam(ExamSubmitRequest request) {
