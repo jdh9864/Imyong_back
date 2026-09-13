@@ -4,6 +4,7 @@ import com.example.demo.domain.Problem;
 import com.example.demo.dto.ProblemReviewResponse;
 import com.example.demo.repository.ProblemRepository;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.stream.Collectors;
@@ -17,6 +18,7 @@ public class ProblemReviewService {
         this.problemRepository = problemRepository;
     }
 
+    @Transactional(readOnly = true)
     public ProblemReviewResponse getProblemsForReview(String domainId) {
         List<Problem> targetProblems;
         boolean isFallback = false;
@@ -25,13 +27,13 @@ public class ProblemReviewService {
         if (domainId != null && !domainId.trim().isEmpty()) {
             targetProblems = problemRepository.findReviewTargetsByDomainId(domainId);
 
-            // 2. 해당 도메인에 오답/미풀이 문제가 없는 경우 전체 문제로 대체
+            // 2. 해당 단원에 오답/미풀이 문제가 없는 경우, 전체 범위의 오답 문제로 대체 (Fallback)
             if (targetProblems.isEmpty()) {
                 targetProblems = problemRepository.findAllReviewTargets();
                 isFallback = true;
             }
         }
-        // 3. 도메인 ID 자체가 제공되지 않은 경우 바로 전체 문제 조회
+        // 3. 도메인 ID가 제공되지 않은 경우, 전체 범위의 오답/미풀이 문제 조회
         else {
             targetProblems = problemRepository.findAllReviewTargets();
             isFallback = true;

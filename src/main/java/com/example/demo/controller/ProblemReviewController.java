@@ -18,7 +18,10 @@ public class ProblemReviewController {
         this.problemReviewService = problemReviewService;
     }
 
-    // GET /api/problems/review?domainId={id}
+    /**
+     * 특정 단원(domainId) 또는 전체 범위의 오답 및 미풀이 문제 조회
+     * GET /api/problems/review?domainId={id}
+     */
     @GetMapping("/review")
     public ResponseEntity<ProblemReviewResponse> getReviewProblems(
             @RequestParam(required = false) String domainId) {
